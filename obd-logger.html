@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- No network access at all: the page cannot load or send anything over the internet -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>OBD Logger</title>
 <style>
 :root{--bg:#fff;--fg:#111;--mut:#666;--card:#f2f2f2;--line:#ddd;--acc:#078a5c;--bad:#c33;--warn:#a36b00}
@@ -56,10 +58,10 @@ label{display:flex;align-items:center;gap:6px;font-size:14px}
   <button data-seq="info">Dongle info</button>
 </div>
 <div class="row" style="margin-top:8px">
-  <input type="text" id="custom" placeholder="e.g. 0105 or ATSH7DF" autocomplete="off" spellcheck="false">
+  <input type="text" id="custom" placeholder="e.g. 0105 or ATSH7E0" autocomplete="off" spellcheck="false">
   <button id="btnCustom">Send</button>
 </div>
-<div class="note">Only AT (dongle setup), 01, 03, 09 and 22 (read) commands are allowed. Anything else is blocked before it leaves the phone.</div>
+<div class="note">Only listed dongle-setup AT commands and 01, 03, 09, 22 read commands are allowed, and car commands only after Init. Everything else is blocked before it leaves the phone. Close other OBD apps first: they share the same Bluetooth connection. Set up before driving; don't use the phone while moving.</div>
 
 <h2>Logging</h2>
 <div class="card">
@@ -70,7 +72,7 @@ label{display:flex;align-items:center;gap:6px;font-size:14px}
   <div class="row" style="margin-top:8px">
     <button id="btnLog" class="primary" disabled>Start logging</button>
     <button id="btnCsv">Download CSV</button>
-    <button id="btnClear">Clear</button>
+    <button id="btnClear">Delete log</button>
   </div>
   <div class="sub" id="logMeta" style="margin-top:6px">0 rows</div>
 </div>
@@ -85,17 +87,32 @@ const SERVICES=[0xfff0,0xffe0,0x18f0,'e7810a71-73ae-499d-8c15-faa9aef0c3f2'];
 const enc=new TextEncoder(),dec=new TextDecoder();
 let dev=null,rx=null,tx=null,buf='',pending=null,queue=Promise.resolve();
 let header='7DF',pollTimer=null,wakeLock=null,rows=[],socMin=null,socMax=null;
+let initDone=false,drainUntil=0,curCmd='',tail='',pollGen=0,resetEpoch=0,connecting=false,lowVolt=0,noSoc=0,banner='';
 const $=id=>document.getElementById(id);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 // ---------- safety allowlist ----------
-function allowed(c){
-  if(/^AT(PP|BRD|BRT|SD|MA)/.test(c)) return false;   // dongle EEPROM / baud / monitor-all
-  if(/^AT[A-Z0-9@]{0,12}$/.test(c)) return true;      // dongle config, never reaches the car
-  if(/^01[0-9A-F]{2}[1-9]?$/.test(c)) return true;    // current data
-  if(c==='03') return true;                           // read stored DTCs
-  if(/^09[0-9A-F]{2}$/.test(c)) return true;          // vehicle info
-  if(/^22[0-9A-F]{4}$/.test(c)) return true;          // UDS read data by identifier
-  return false;
+// AT commands: explicit list only. Some AT commands change how the dongle frames
+// what you type (ATCAF0, ATCEA xx, ATFCSD/ATFCSH/ATFCSM1, ATWM...), which could turn
+// an innocent-looking "0104" into a raw "clear codes" frame. So none of those are allowed.
+// ATSH: only diagnostic REQUEST IDs. Any other 11-bit ID would make the request frame
+// impersonate a normal car message (speed, brakes, …) that other ECUs act on.
+// 7DF = OBD broadcast, 7E0-7E7 = OBD ECUs, 747 = Toyota HV battery ECU. Add others deliberately.
+const AT_OK=[/^ATZ$/,/^ATD$/,/^AT@1$/,/^ATDPN?$/,/^ATRV$/,/^ATE[01]$/,/^ATL[01]$/,
+  /^ATS[01]$/,/^ATH[01]$/,/^ATSP6$/,/^ATSH(7DF|7E[0-7]|747)$/,/^ATST[0-9A-F]{2}$/,
+  /^ATAT[0-2]$/,/^ATCAF1$/,/^ATFCSM0$/,/^ATCEA$/];
+// Returns null if the command may be sent, otherwise the reason it is blocked.
+function blockReason(c){
+  if(c.startsWith('AT')) return AT_OK.some(r=>r.test(c))?null:'AT command not on allowlist';
+  if(!initDone) return 'press Init first (it forces safe dongle settings)';
+  if(/^01[0-9A-F]{2}[1-9]?$/.test(c)) return null;    // mode 01: current data
+  if(c==='03') return null;                           // mode 03: read stored codes
+  if(/^09[0-9A-F]{2}$/.test(c)) return null;          // mode 09: vehicle info
+  // UDS 0x22: read data by identifier, only to one specific ECU. Broadcast (7DF) is refused: then
+  // unknown ECUs may answer in several parts, and the dongle sends automatic "flow control" frames
+  // to IDs derived from whoever answered, which this page can't vet.
+  if(/^22[0-9A-F]{4}$/.test(c)) return header==='7DF'?'0x22 not allowed on broadcast header 7DF':null;
+  return 'not a read command';
 }
 
 // ---------- UI helpers ----------
@@ -111,11 +128,23 @@ function log(t,cls){
 function setConnected(on){
   $('btnConnect').disabled=on;$('btnDisconnect').disabled=!on;$('btnLog').disabled=!on;
 }
+// While logging, manual commands are disabled so they can't interleave with the poll sequence
+function setManual(on){document.querySelectorAll('[data-seq],#btnCustom,#custom').forEach(el=>el.disabled=!on)}
+function lostInit(why){
+  resetEpoch++;   // counted even while Init is running, so Init can tell it was interrupted
+  if(!initDone) return;
+  initDone=false;
+  status('Dongle was reset ('+why+'). '+(pollTimer!==null?'Re-running Init…':'Press Init again.'),'bad');
+  log('Init cleared: '+why+'. Car commands blocked until Init.','warn');
+}
 
 // ---------- BLE ----------
 async function connect(){
   if(!navigator.bluetooth){status('This browser has no Web Bluetooth. Use Chrome on Android.','bad');return}
+  if(connecting||tx) return;   // ignore double taps; one connection at a time
+  connecting=true;$('btnConnect').disabled=true;
   try{
+    if(!(await acquireLock())) throw new Error('another tab of this page is already using the dongle');
     dev=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:SERVICES});
     dev.addEventListener('gattserverdisconnected',onDisconnect);
     status('Connecting to '+(dev.name||'device')+'…');
@@ -135,23 +164,69 @@ async function connect(){
     rx.addEventListener('characteristicvaluechanged',onData);
     status('Connected: '+(dev.name||'device')+'. Press Init.','ok');
     setConnected(true);
-  }catch(e){status('Connect failed: '+e.message,'bad');log('Connect failed: '+e.message,'bad')}
+  }catch(e){
+    status('Connect failed: '+e.message,'bad');log('Connect failed: '+e.message,'bad');
+    rx=tx=null;$('btnConnect').disabled=false;freeLock();
+  }finally{connecting=false}
 }
+// Exclusive lock across tabs of this site, held for the whole connection
+let lockRelease=null;
+function acquireLock(){
+  if(!navigator.locks) return Promise.resolve(true);
+  if(lockRelease) return Promise.resolve(true);
+  return new Promise(res=>{
+    navigator.locks.request('obd-dongle',{ifAvailable:true},lock=>{
+      if(!lock){res(false);return}
+      res(true);
+      return new Promise(r=>{lockRelease=r});
+    }).catch(()=>res(false));
+  });
+}
+function freeLock(){if(lockRelease){const r=lockRelease;lockRelease=null;r()}}
 function onData(e){
-  buf+=dec.decode(e.target.value);
+  const chunk=dec.decode(e.target.value,{stream:true});
+  // Reboot detection runs on EVERY incoming byte, before anything is discarded, including
+  // data that arrives while idle. "tail" keeps the last few chars so a banner split across
+  // BLE packets is still caught. Only ATZ/ATI/AT@1 are expected to print the banner.
+  tail=(tail+chunk).slice(-48);
+  // Only ATZ is allowed to print the banner. (ATI is not on the allowlist for this reason:
+  // its normal reply looks identical to a reboot, which would hide a real one.)
+  // Matches this dongle's own banner (learned at Init, since clones vary: "ELM 327", "ELM329", …)
+  // plus the generic patterns.
+  const T=tail.toUpperCase();
+  if(((banner&&T.includes(banner))||/ELM\s*-?\s*3\d\d|LV RESET/.test(T))&&!(pending&&curCmd==='ATZ')){tail='';lostInit('dongle rebooted')}
+  if(Date.now()<drainUntil){buf='';return}   // discard late replies to a timed-out command
+  buf+=chunk;
+  if(buf.length>4096) buf=buf.slice(-1024);    // a misbehaving dongle can't exhaust memory
   const i=buf.indexOf('>');
-  if(i>=0){const r=buf.slice(0,i);buf=buf.slice(i+1);if(pending){const p=pending;pending=null;p(r)}}
+  if(i>=0){
+    const r=buf.slice(0,i);buf=buf.slice(i+1);
+    if(pending){const p=pending;pending=null;tail='';p(r)}
+    // A reply nobody here asked for: another app sent a command on the shared connection (or the
+    // dongle rebooted while idle; indistinguishable). Don't auto-recover: re-initialising would reset
+    // the dongle under the other app's feet. Stop and let the person check.
+    else{
+      lostInit('unexpected reply: another app may be using the dongle');
+      if(pollTimer!==null){stopPoll();log('Logging stopped: close other OBD apps, then press Init and start again','bad')}
+      status('Unexpected dongle activity. Close other OBD apps, then press Init.','bad');
+    }
+  }
 }
-function onDisconnect(){status('Disconnected','bad');rx=tx=null;setConnected(false);stopPoll();log('Disconnected','warn')}
-function disconnect(){stopPoll();if(dev&&dev.gatt.connected) dev.gatt.disconnect()}
+function onDisconnect(){status('Disconnected','bad');rx=tx=null;pending=null;initDone=false;freeLock();setConnected(false);stopPoll();log('Disconnected','warn')}
+function disconnect(){stopPoll();if(dev&&dev.gatt.connected) dev.gatt.disconnect();onDisconnect()}
 
 function send(raw){
   const c=raw.toUpperCase().replace(/\s+/g,'');
-  if(!allowed(c)){log('BLOCKED '+c+' (not on read-only allowlist)','bad');return Promise.reject(new Error('blocked'))}
-  const job=queue.then(()=>new Promise((res,rej)=>{
+  const why=blockReason(c);
+  if(why){log('BLOCKED '+c+' ('+why+')','bad');return Promise.reject(new Error('blocked'))}
+  if(c==='ATZ'||c==='ATD') lostInit(c+' sent');   // restores power-on defaults, so safe settings must be re-applied
+  const job=queue.then(async()=>{const w=drainUntil-Date.now();if(w>0) await sleep(w)}).then(()=>new Promise((res,rej)=>{
     if(!tx){rej(new Error('not connected'));return}
-    buf='';
-    const to=setTimeout(()=>{pending=null;rej(new Error('timeout'))},8000);
+    // Re-check at the moment of sending: Init may have been lost while this command waited in the queue
+    if(!c.startsWith('AT')&&!initDone){log('BLOCKED '+c+' (Init lost while queued)','bad');rej(new Error('blocked'));return}
+    buf='';tail='';curCmd=c;
+    // No reply = dongle state unknown, so treat it like a reset
+    const to=setTimeout(()=>{pending=null;buf='';drainUntil=Date.now()+1500;lostInit('no reply from dongle');rej(new Error('timeout'))},8000);
     pending=r=>{clearTimeout(to);res(r)};
     const data=enc.encode(c+'\r');
     (tx.properties.writeWithoutResponse?tx.writeValueWithoutResponse(data):tx.writeValue(data))
@@ -185,46 +260,110 @@ function showSoc(v){
 
 // ---------- canned sequences ----------
 const SEQ={
-  init:['ATZ','ATE0','ATL0','ATS0','ATH1','ATSP6'],
+  // ATCAF1/ATFCSM0/ATCEA force normal framing even if another app changed them
+  init:['ATZ','ATE0','ATL0','ATS0','ATH1','ATCAF1','ATFCSM0','ATCEA','ATSP6'],
   volt:['ATRV'],
   pids:['0100','0120','0140'],
-  info:['ATI','AT@1','ATDP']
+  info:['AT@1','ATDP']   // firmware version is shown in the Init (ATZ) reply
 };
 async function runSeq(name){
-  if(name==='soc'){await ensureHeader('7DF');try{showSoc(decodeSoc(await send('015B')))}catch(e){}return}
-  if(name==='toyotaSoc'){await ensureHeader('747');try{await send('227A76')}catch(e){}return}
-  if(name==='toyotaVA'){await ensureHeader('747');try{await send('227A53')}catch(e){}return}
-  if(SEQ[name]){if(name==='init') header='7DF';await seq(SEQ[name])}
+  try{
+    if(name==='soc'){await ensureHeader('7DF');showSoc(decodeSoc(await send('015B')));return}
+    if(name==='toyotaSoc'){await ensureHeader('747');await send('227A76');return}
+    if(name==='toyotaVA'){await ensureHeader('747');await send('227A53');return}
+    if(name==='init'){await runInit();return}
+    if(SEQ[name]) await seq(SEQ[name]);
+  }catch(e){/* already logged */}
+}
+async function runInit(){
+  initDone=false;header='7DF';
+  let epoch=null;
+  for(const c of SEQ.init){
+    let r;
+    try{r=await send(c)}catch(e){status('Init failed at '+c,'bad');return}
+    if(c==='ATZ'){
+      if(!/ELM/i.test(r)){status('Device did not identify as ELM327. Stopped.','bad');log('No ELM327 ID in reply. Wrong device? Nothing else was sent.','bad');return}
+      banner=(r.split('\n').find(l=>/ELM/i.test(l))||'').trim().toUpperCase();   // remembered for reboot detection
+      epoch=resetEpoch;   // any reset after this point invalidates the settings applied below
+    }
+    // ATCAF1 is the critical one: must be confirmed. A clone that doesn't know ATFCSM/ATCEA
+    // answers "?", which is acceptable: then it can't be in those non-default modes either.
+    if(c==='ATCAF1'&&!/OK/.test(r)){status('Dongle did not confirm ATCAF1. Stopped for safety.','bad');log('ATCAF1 not confirmed. Car commands stay blocked.','bad');return}
+  }
+  if(epoch===null||resetEpoch!==epoch){status('Dongle reset during Init. Press Init again.','bad');log('Reset detected during Init; not marking Ready.','bad');return}
+  initDone=true;status('Ready: '+(dev&&dev.name||'dongle'),'ok');
 }
 
 // ---------- logging ----------
-function loadRows(){try{rows=JSON.parse(localStorage.getItem('obdRows')||'[]')}catch(e){rows=[]}updateMeta()}
-function saveRows(){try{localStorage.setItem('obdRows',JSON.stringify(rows))}catch(e){}}
+// Stored data is untrusted: any page on the same origin (e.g. your other GitHub Pages repos) can write it
+function loadRows(){
+  let x=[];try{x=JSON.parse(localStorage.getItem('obdRows')||'[]')}catch(e){}
+  rows=(Array.isArray(x)?x:[]).filter(r=>r&&typeof r==='object').map(r=>({t:String(r.t??''),cmd:String(r.cmd??''),soc:String(r.soc??''),raw:String(r.raw??'')}));
+  updateMeta();
+}
+let saveWarned=false;
+function saveRows(){
+  try{localStorage.setItem('obdRows',JSON.stringify(rows));saveWarned=false}
+  catch(e){if(!saveWarned){saveWarned=true;log('Phone storage full or unavailable: download the CSV now, new rows are only in memory','bad')}}
+}
 function addRow(cmd,resp,soc){rows.push({t:new Date().toISOString(),cmd,soc:soc==null?'':soc.toFixed(2),raw:resp});updateMeta();if(rows.length%10===0)saveRows()}
 function updateMeta(){$('logMeta').textContent=rows.length+' rows'+(rows.length?' · since '+new Date(rows[0].t).toLocaleString():'')}
 
-async function pollOnce(){
+async function pollOnce(gen){
+  // Every send in an iteration first checks that this loop is still the current one,
+  // so Stop (or auto-stop) takes effect before the next command, not after the iteration.
+  const alive=()=>{if(gen!==pollGen) throw new Error('stopped')};
+  const send_=c=>{alive();return send(c)};
+  const ensureHeader=async h=>{if(header!==h) await send_('ATSH'+h)};
+  if(!initDone){
+    // Auto-recover: Init is AT-only and re-verifies the dongle before any car command
+    await runInit();
+    if(gen!==pollGen) return;
+    if(!initDone){stopPoll();status('Init failed while logging. Logging stopped.','bad');return}
+  }
   try{
+    // Car-off detection: requests keep the car's network awake and drain the 12 V battery,
+    // so stop when the car looks off. Two independent signals:
+    //  - 12 V below 13.0 V (when READY, the DC-DC converter holds it higher) for 3 polls
+    //  - no SOC answer for 5 polls
+    const rv=await send_('ATRV');const volts=parseFloat((rv.match(/(\d+(\.\d+)?)\s*V/i)||[])[1]);
+    lowVolt=(!isNaN(volts)&&volts<13.0)?lowVolt+1:0;
     await ensureHeader('7DF');
-    const r=await send('015B');const v=decodeSoc(r);showSoc(v);addRow('015B',r,v);
+    const r=await send_('015B');const v=decodeSoc(r);showSoc(v);addRow('015B',r,v);
+    noSoc=v==null?noSoc+1:0;
+    if(lowVolt>=3||noSoc>=5){
+      stopPoll();
+      const why=lowVolt>=3?'12 V at '+volts.toFixed(1)+' V':'no answer from the car';
+      status('Car seems off ('+why+'). Logging stopped to protect the 12 V battery.','bad');
+      log('Auto-stopped logging: '+why,'warn');
+      return;
+    }
     if($('incToyota').checked){
       await ensureHeader('747');
-      for(const d of ['227A76','227A53']){const x=await send(d);addRow(d,x,null)}
+      for(const d of ['227A76','227A53']){const x=await send_(d);addRow(d,x,null)}
     }
-  }catch(e){addRow('error','',null)}
+  }catch(e){
+    if(e.message==='stopped') return;
+    if(e.message==='not connected'){stopPoll();return}
+    if(e.message==='blocked') return;   // Init was lost mid-iteration; next tick re-inits
+    addRow('error',e.message,null);
+  }
 }
 async function startPoll(){
-  if(pollTimer) return;
+  if(pollTimer!==null) return;
+  if(!initDone){log('Press Init before logging','warn');return}
   const ms=+$('interval').value*1000;
-  $('btnLog').textContent='Stop logging';$('btnLog').className='stop';
+  $('btnLog').textContent='Stop logging';$('btnLog').className='stop';setManual(false);
   try{wakeLock=await navigator.wakeLock.request('screen')}catch(e){log('Screen wake lock unavailable; keep screen on manually','warn')}
-  const tick=async()=>{await pollOnce();if(pollTimer!==null) pollTimer=setTimeout(tick,ms)};
+  lowVolt=0;noSoc=0;
+  const gen=++pollGen;   // a loop from an earlier Start can never keep running
+  const tick=async()=>{if(gen!==pollGen) return;await pollOnce(gen);if(gen===pollGen&&pollTimer!==null) pollTimer=setTimeout(tick,ms)};
   pollTimer=0;tick();
 }
 function stopPoll(){
   if(pollTimer===null) return;
-  clearTimeout(pollTimer);pollTimer=null;saveRows();
-  $('btnLog').textContent='Start logging';$('btnLog').className='primary';
+  pollGen++;clearTimeout(pollTimer);pollTimer=null;saveRows();
+  $('btnLog').textContent='Start logging';$('btnLog').className='primary';setManual(true);
   if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null}
 }
 document.addEventListener('visibilitychange',async()=>{
@@ -234,8 +373,9 @@ document.addEventListener('visibilitychange',async()=>{
 
 function downloadCsv(){
   saveRows();
-  const q=s=>'"'+String(s).replace(/"/g,'""').replace(/\n/g,' | ')+'"';
-  const csv='time,cmd,soc_pct,raw\n'+rows.map(r=>[r.t,r.cmd,r.soc,q(r.raw)].join(',')).join('\n');
+  // Quote, and neutralise spreadsheet formulas: the raw text comes from the dongle's firmware
+  const q=s=>{s=String(s).replace(/"/g,'""').replace(/\n/g,' | ');if(/^[=+\-@\t\r]/.test(s)) s="'"+s;return '"'+s+'"'};
+  const csv='time,cmd,soc_pct,raw\n'+rows.map(r=>[r.t,r.cmd,r.soc,r.raw].map(q).join(',')).join('\n');
   const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
   a.download='obd-log-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
