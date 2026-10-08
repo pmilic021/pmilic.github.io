@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OBD Logger</title>
+<style>
+:root{--bg:#fff;--fg:#111;--mut:#666;--card:#f2f2f2;--line:#ddd;--acc:#078a5c;--bad:#c33;--warn:#a36b00}
+@media (prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--mut:#999;--card:#1c1c1c;--line:#333;--acc:#2fc48d;--bad:#ff6b6b;--warn:#e0b040}}
+*{box-sizing:border-box}
+body{margin:0;padding:12px 16px 40px;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
+h1{font-size:18px;margin:4px 0 10px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut);margin:18px 0 6px}
+.card{background:var(--card);border-radius:10px;padding:12px}
+.row{display:flex;flex-wrap:wrap;gap:8px}
+button{flex:1 1 auto;min-height:44px;padding:8px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit;font-weight:600}
+button.primary{background:var(--acc);color:#fff;border-color:var(--acc)}
+button.stop{background:var(--bad);color:#fff;border-color:var(--bad)}
+button:disabled{opacity:.4}
+input,select{min-height:44px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+input[type=text]{flex:1 1 140px;font-family:ui-monospace,monospace;text-transform:uppercase}
+#status{font-size:13px;color:var(--mut);margin-bottom:8px}
+#status.ok{color:var(--acc)}#status.bad{color:var(--bad)}
+.big{font-size:56px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.sub{color:var(--mut);font-size:13px}
+#log{font:12px/1.35 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;max-height:45vh;overflow:auto;margin:0}
+#log .bad{color:var(--bad)}#log .warn{color:var(--warn)}
+label{display:flex;align-items:center;gap:6px;font-size:14px}
+.note{font-size:12px;color:var(--mut);margin-top:6px}
+</style>
+</head>
+<body>
+<h1>OBD Logger <span class="sub">read-only</span></h1>
+<div id="status">Not connected</div>
+<div class="row">
+  <button id="btnConnect" class="primary">Connect dongle</button>
+  <button id="btnDisconnect" disabled>Disconnect</button>
+</div>
+
+<h2>Hybrid battery SOC (015B)</h2>
+<div class="card">
+  <div class="big" id="soc">--</div>
+  <div class="sub" id="socMeta">No reading yet</div>
+</div>
+
+<h2>Test commands</h2>
+<div class="row">
+  <button data-seq="init">1. Init</button>
+  <button data-seq="soc">2. SOC 015B</button>
+  <button data-seq="toyotaSoc">3. Toyota SOC</button>
+  <button data-seq="toyotaVA">4. Toyota V/A</button>
+</div>
+<div class="row" style="margin-top:8px">
+  <button data-seq="volt">12V (ATRV)</button>
+  <button data-seq="pids">Supported PIDs</button>
+  <button data-seq="info">Dongle info</button>
+</div>
+<div class="row" style="margin-top:8px">
+  <input type="text" id="custom" placeholder="e.g. 0105 or ATSH7DF" autocomplete="off" spellcheck="false">
+  <button id="btnCustom">Send</button>
+</div>
+<div class="note">Only AT (dongle setup), 01, 03, 09 and 22 (read) commands are allowed. Anything else is blocked before it leaves the phone.</div>
+
+<h2>Logging</h2>
+<div class="card">
+  <div class="row" style="align-items:center">
+    <label>Every <select id="interval"><option>1</option><option selected>2</option><option>5</option><option>10</option></select> s</label>
+    <label><input type="checkbox" id="incToyota"> also Toyota DIDs</label>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="btnLog" class="primary" disabled>Start logging</button>
+    <button id="btnCsv">Download CSV</button>
+    <button id="btnClear">Clear</button>
+  </div>
+  <div class="sub" id="logMeta" style="margin-top:6px">0 rows</div>
+</div>
+
+<h2>Console</h2>
+<div class="card"><pre id="log"></pre></div>
+
+<script>
+'use strict';
+// Common GATT services used by BLE ELM327 clones
+const SERVICES=[0xfff0,0xffe0,0x18f0,'e7810a71-73ae-499d-8c15-faa9aef0c3f2'];
+const enc=new TextEncoder(),dec=new TextDecoder();
+let dev=null,rx=null,tx=null,buf='',pending=null,queue=Promise.resolve();
+let header='7DF',pollTimer=null,wakeLock=null,rows=[],socMin=null,socMax=null;
+const $=id=>document.getElementById(id);
+
+// ---------- safety allowlist ----------
+function allowed(c){
+  if(/^AT(PP|BRD|BRT|SD|MA)/.test(c)) return false;   // dongle EEPROM / baud / monitor-all
+  if(/^AT[A-Z0-9@]{0,12}$/.test(c)) return true;      // dongle config, never reaches the car
+  if(/^01[0-9A-F]{2}[1-9]?$/.test(c)) return true;    // current data
+  if(c==='03') return true;                           // read stored DTCs
+  if(/^09[0-9A-F]{2}$/.test(c)) return true;          // vehicle info
+  if(/^22[0-9A-F]{4}$/.test(c)) return true;          // UDS read data by identifier
+  return false;
+}
+
+// ---------- UI helpers ----------
+function status(t,cls){const s=$('status');s.textContent=t;s.className=cls||''}
+function log(t,cls){
+  const el=$('log'),line=document.createElement('div');
+  line.textContent=new Date().toLocaleTimeString()+'  '+t;
+  if(cls) line.className=cls;
+  el.appendChild(line);
+  while(el.childNodes.length>400) el.removeChild(el.firstChild);
+  el.scrollTop=el.scrollHeight;
+}
+function setConnected(on){
+  $('btnConnect').disabled=on;$('btnDisconnect').disabled=!on;$('btnLog').disabled=!on;
+}
+
+// ---------- BLE ----------
+async function connect(){
+  if(!navigator.bluetooth){status('This browser has no Web Bluetooth. Use Chrome on Android.','bad');return}
+  try{
+    dev=await navigator.bluetooth.requestDevice({acceptAllDevices:true,optionalServices:SERVICES});
+    dev.addEventListener('gattserverdisconnected',onDisconnect);
+    status('Connecting to '+(dev.name||'device')+'…');
+    const server=await dev.gatt.connect();
+    const svcs=await server.getPrimaryServices();
+    for(const s of svcs){
+      let chars;try{chars=await s.getCharacteristics()}catch(e){continue}
+      let r=null,w=null;
+      for(const c of chars){
+        if(!r&&(c.properties.notify||c.properties.indicate)) r=c;
+        if(!w&&(c.properties.write||c.properties.writeWithoutResponse)) w=c;
+      }
+      if(r&&w){rx=r;tx=w;log('Using service '+s.uuid);break}
+    }
+    if(!rx||!tx) throw new Error('No serial-like characteristic found. Dongle may be Bluetooth Classic.');
+    await rx.startNotifications();
+    rx.addEventListener('characteristicvaluechanged',onData);
+    status('Connected: '+(dev.name||'device')+'. Press Init.','ok');
+    setConnected(true);
+  }catch(e){status('Connect failed: '+e.message,'bad');log('Connect failed: '+e.message,'bad')}
+}
+function onData(e){
+  buf+=dec.decode(e.target.value);
+  const i=buf.indexOf('>');
+  if(i>=0){const r=buf.slice(0,i);buf=buf.slice(i+1);if(pending){const p=pending;pending=null;p(r)}}
+}
+function onDisconnect(){status('Disconnected','bad');rx=tx=null;setConnected(false);stopPoll();log('Disconnected','warn')}
+function disconnect(){stopPoll();if(dev&&dev.gatt.connected) dev.gatt.disconnect()}
+
+function send(raw){
+  const c=raw.toUpperCase().replace(/\s+/g,'');
+  if(!allowed(c)){log('BLOCKED '+c+' (not on read-only allowlist)','bad');return Promise.reject(new Error('blocked'))}
+  const job=queue.then(()=>new Promise((res,rej)=>{
+    if(!tx){rej(new Error('not connected'));return}
+    buf='';
+    const to=setTimeout(()=>{pending=null;rej(new Error('timeout'))},8000);
+    pending=r=>{clearTimeout(to);res(r)};
+    const data=enc.encode(c+'\r');
+    (tx.properties.writeWithoutResponse?tx.writeValueWithoutResponse(data):tx.writeValue(data))
+      .catch(e=>{clearTimeout(to);pending=null;rej(e)});
+  }));
+  queue=job.catch(()=>{});
+  return job.then(r=>{
+    const lines=r.replace(/\r/g,'\n').split('\n').map(s=>s.trim()).filter(s=>s&&s!==c);
+    if(/^ATSH/.test(c)) header=c.slice(4);
+    if(c==='ATZ'||c==='ATD') header='7DF';
+    log('> '+c+'\n'+(lines.join('\n')||'(empty)'));
+    return lines.join('\n');
+  },e=>{log('> '+c+'  ['+e.message+']','bad');throw e});
+}
+async function seq(cmds){for(const c of cmds){try{await send(c)}catch(e){if(e.message==='blocked'||e.message==='not connected')return}}}
+async function ensureHeader(h){if(header!==h) await send('ATSH'+h)}
+
+// ---------- decoding ----------
+function decodeSoc(resp){
+  const h=resp.toUpperCase().replace(/[^0-9A-F]/g,'');
+  const i=h.indexOf('415B');
+  if(i<0||h.length<i+6) return null;
+  return parseInt(h.substr(i+4,2),16)*100/255;
+}
+function showSoc(v){
+  if(v==null) return;
+  socMin=socMin==null?v:Math.min(socMin,v);socMax=socMax==null?v:Math.max(socMax,v);
+  $('soc').textContent=v.toFixed(1)+'%';
+  $('socMeta').textContent='Session min '+socMin.toFixed(1)+'% · max '+socMax.toFixed(1)+'% · '+new Date().toLocaleTimeString();
+}
+
+// ---------- canned sequences ----------
+const SEQ={
+  init:['ATZ','ATE0','ATL0','ATS0','ATH1','ATSP6'],
+  volt:['ATRV'],
+  pids:['0100','0120','0140'],
+  info:['ATI','AT@1','ATDP']
+};
+async function runSeq(name){
+  if(name==='soc'){await ensureHeader('7DF');try{showSoc(decodeSoc(await send('015B')))}catch(e){}return}
+  if(name==='toyotaSoc'){await ensureHeader('747');try{await send('227A76')}catch(e){}return}
+  if(name==='toyotaVA'){await ensureHeader('747');try{await send('227A53')}catch(e){}return}
+  if(SEQ[name]){if(name==='init') header='7DF';await seq(SEQ[name])}
+}
+
+// ---------- logging ----------
+function loadRows(){try{rows=JSON.parse(localStorage.getItem('obdRows')||'[]')}catch(e){rows=[]}updateMeta()}
+function saveRows(){try{localStorage.setItem('obdRows',JSON.stringify(rows))}catch(e){}}
+function addRow(cmd,resp,soc){rows.push({t:new Date().toISOString(),cmd,soc:soc==null?'':soc.toFixed(2),raw:resp});updateMeta();if(rows.length%10===0)saveRows()}
+function updateMeta(){$('logMeta').textContent=rows.length+' rows'+(rows.length?' · since '+new Date(rows[0].t).toLocaleString():'')}
+
+async function pollOnce(){
+  try{
+    await ensureHeader('7DF');
+    const r=await send('015B');const v=decodeSoc(r);showSoc(v);addRow('015B',r,v);
+    if($('incToyota').checked){
+      await ensureHeader('747');
+      for(const d of ['227A76','227A53']){const x=await send(d);addRow(d,x,null)}
+    }
+  }catch(e){addRow('error','',null)}
+}
+async function startPoll(){
+  if(pollTimer) return;
+  const ms=+$('interval').value*1000;
+  $('btnLog').textContent='Stop logging';$('btnLog').className='stop';
+  try{wakeLock=await navigator.wakeLock.request('screen')}catch(e){log('Screen wake lock unavailable; keep screen on manually','warn')}
+  const tick=async()=>{await pollOnce();if(pollTimer!==null) pollTimer=setTimeout(tick,ms)};
+  pollTimer=0;tick();
+}
+function stopPoll(){
+  if(pollTimer===null) return;
+  clearTimeout(pollTimer);pollTimer=null;saveRows();
+  $('btnLog').textContent='Start logging';$('btnLog').className='primary';
+  if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null}
+}
+document.addEventListener('visibilitychange',async()=>{
+  if(document.visibilityState==='visible'&&pollTimer!==null&&!wakeLock){try{wakeLock=await navigator.wakeLock.request('screen')}catch(e){}}
+  if(document.visibilityState==='hidden') saveRows();
+});
+
+function downloadCsv(){
+  saveRows();
+  const q=s=>'"'+String(s).replace(/"/g,'""').replace(/\n/g,' | ')+'"';
+  const csv='time,cmd,soc_pct,raw\n'+rows.map(r=>[r.t,r.cmd,r.soc,q(r.raw)].join(',')).join('\n');
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download='obd-log-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.csv';
+  a.click();setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+}
+
+// ---------- wiring ----------
+$('btnConnect').onclick=connect;
+$('btnDisconnect').onclick=disconnect;
+document.querySelectorAll('[data-seq]').forEach(b=>b.onclick=()=>runSeq(b.dataset.seq));
+$('btnCustom').onclick=()=>{const v=$('custom').value.trim();if(v) send(v).catch(()=>{})};
+$('custom').addEventListener('keydown',e=>{if(e.key==='Enter') $('btnCustom').click()});
+$('btnLog').onclick=()=>pollTimer===null?startPoll():stopPoll();
+$('btnCsv').onclick=downloadCsv;
+$('btnClear').onclick=()=>{if(confirm('Delete all logged rows on this phone?')){rows=[];saveRows();updateMeta()}};
+loadRows();
+if(!navigator.bluetooth) status('This browser has no Web Bluetooth. Use Chrome on Android.','bad');
+</script>
+</body>
+</html>
